@@ -130,7 +130,8 @@ could cause more requests than allowed quota to go through.
 ### Monitoring
 - Regular analytics to ensure algorithm effectiveness and adjust rules as needed.
 
-1. Token Bucket (most common)
+## Impelementation 
+### 1. Token Bucket (most common)
 Tokens refill at a fixed rate; each request consumes one token.
 ```python
 import time
@@ -156,7 +157,7 @@ class TokenBucket:
         self.last_refill = now
 ```
 
-2. Sliding Window Counter (Redis-based, production-ready)
+### 2. Sliding Window Counter (Redis-based, production-ready)
 Tracks requests in a rolling time window — the most accurate approach.
 ```python
 import redis
@@ -184,7 +185,7 @@ class SlidingWindowRateLimiter:
         return request_count <= self.limit
 ```
 
-3. Fixed Window Counter (simplest)
+### 3. Fixed Window Counter (simplest)
 ```python
 class FixedWindowRateLimiter:
     def __init__(self, limit, window_seconds):
@@ -205,7 +206,7 @@ class FixedWindowRateLimiter:
         return False
 ```
 
-4. Middleware Integration (FastAPI example)
+### 4. Middleware Integration (FastAPI example)
 ```python 
 from fastapi import FastAPI, Request, HTTPException
 from functools import wraps
