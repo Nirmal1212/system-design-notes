@@ -130,6 +130,18 @@ could cause more requests than allowed quota to go through.
 ### Monitoring
 - Regular analytics to ensure algorithm effectiveness and adjust rules as needed.
 
+Algorithm Comparison
+AlgorithmAccuracyMemoryBurst HandlingBest ForToken BucketGoodLow✅ Allows burstsMost APIsSliding WindowBestMedium✅ SmoothProduction systemsFixed WindowPoor (boundary spikes)Low❌Simple use casesLeaky BucketGoodLow❌ Strict queueStreaming / smooth output
+
+Key Design Decisions
+
+Per IP vs per API key — API keys are more reliable (IPs can be shared via NAT)
+Distributed systems — use Redis (atomic ops) instead of in-memory to share state across instances
+Return proper headers — always send X-RateLimit-Limit, X-RateLimit-Remaining, Retry-After
+Tiered limits — different limits per plan (free: 100/hr, pro: 10k/hr)
+
+The Sliding Window + Redis approach is what most production APIs (GitHub, Stripe, OpenAI) use.
+
 ## Impelementation 
 ### 1. Token Bucket (most common)
 Tokens refill at a fixed rate; each request consumes one token.
@@ -232,14 +244,3 @@ async def rate_limit_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 ```
-Algorithm Comparison
-AlgorithmAccuracyMemoryBurst HandlingBest ForToken BucketGoodLow✅ Allows burstsMost APIsSliding WindowBestMedium✅ SmoothProduction systemsFixed WindowPoor (boundary spikes)Low❌Simple use casesLeaky BucketGoodLow❌ Strict queueStreaming / smooth output
-
-Key Design Decisions
-
-Per IP vs per API key — API keys are more reliable (IPs can be shared via NAT)
-Distributed systems — use Redis (atomic ops) instead of in-memory to share state across instances
-Return proper headers — always send X-RateLimit-Limit, X-RateLimit-Remaining, Retry-After
-Tiered limits — different limits per plan (free: 100/hr, pro: 10k/hr)
-
-The Sliding Window + Redis approach is what most production APIs (GitHub, Stripe, OpenAI) use.
