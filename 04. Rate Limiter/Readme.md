@@ -130,21 +130,10 @@ could cause more requests than allowed quota to go through.
 ### Monitoring
 - Regular analytics to ensure algorithm effectiveness and adjust rules as needed.
 
-Algorithm Comparison
-AlgorithmAccuracyMemoryBurst HandlingBest ForToken BucketGoodLow✅ Allows burstsMost APIsSliding WindowBestMedium✅ SmoothProduction systemsFixed WindowPoor (boundary spikes)Low❌Simple use casesLeaky BucketGoodLow❌ Strict queueStreaming / smooth output
-
-Key Design Decisions
-
-Per IP vs per API key — API keys are more reliable (IPs can be shared via NAT)
-Distributed systems — use Redis (atomic ops) instead of in-memory to share state across instances
-Return proper headers — always send X-RateLimit-Limit, X-RateLimit-Remaining, Retry-After
-Tiered limits — different limits per plan (free: 100/hr, pro: 10k/hr)
-
-The Sliding Window + Redis approach is what most production APIs (GitHub, Stripe, OpenAI) use.
-
-## Impelementation 
 ### 1. Token Bucket (most common)
+
 Tokens refill at a fixed rate; each request consumes one token.
+
 ```python
 import time
 
@@ -169,8 +158,12 @@ class TokenBucket:
         self.last_refill = now
 ```
 
+---
+
 ### 2. Sliding Window Counter (Redis-based, production-ready)
+
 Tracks requests in a rolling time window — the most accurate approach.
+
 ```python
 import redis
 import time
@@ -197,7 +190,10 @@ class SlidingWindowRateLimiter:
         return request_count <= self.limit
 ```
 
+---
+
 ### 3. Fixed Window Counter (simplest)
+
 ```python
 class FixedWindowRateLimiter:
     def __init__(self, limit, window_seconds):
@@ -218,8 +214,11 @@ class FixedWindowRateLimiter:
         return False
 ```
 
+---
+
 ### 4. Middleware Integration (FastAPI example)
-```python 
+
+```python
 from fastapi import FastAPI, Request, HTTPException
 from functools import wraps
 
@@ -244,3 +243,25 @@ async def rate_limit_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 ```
+
+---
+
+### Algorithm Comparison
+
+| Algorithm | Accuracy | Memory | Burst Handling | Best For |
+|---|---|---|---|---|
+| **Token Bucket** | Good | Low | ✅ Allows bursts | Most APIs |
+| **Sliding Window** | Best | Medium | ✅ Smooth | Production systems |
+| **Fixed Window** | Poor (boundary spikes) | Low | ❌ | Simple use cases |
+| **Leaky Bucket** | Good | Low | ❌ Strict queue | Streaming / smooth output |
+
+---
+
+### Key Design Decisions
+
+- **Per IP vs per API key** — API keys are more reliable (IPs can be shared via NAT)
+- **Distributed systems** — use Redis (atomic ops) instead of in-memory to share state across instances
+- **Return proper headers** — always send `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `Retry-After`
+- **Tiered limits** — different limits per plan (free: 100/hr, pro: 10k/hr)
+
+The **Sliding Window + Redis** approach is what most production APIs (GitHub, Stripe, OpenAI) use.
