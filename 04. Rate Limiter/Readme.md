@@ -130,3 +130,115 @@ could cause more requests than allowed quota to go through.
 ### Monitoring
 - Regular analytics to ensure algorithm effectiveness and adjust rules as needed.
 
+1. Token Bucket (most common)
+Tokens refill at a fixed rate; each request consumes one token.
+```python
+import time
+
+class TokenBucket:
+    def __init__(self, capacity, refill_rate):
+        self.capacity = capacity          # max tokens
+        self.tokens = capacity            # current tokens
+        self.refill_rate = refill_rate    # tokens per second
+        self.last_refill = time.time()
+
+    def allow_request(self):
+        self._refill()
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False  # rate limited
+
+    def _refill(self):
+        now = time.time()
+        elapsed = now - self.last_refill
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+        self.last_refill = now
+```
+
+2. Sliding Window Counter (Redis-based, production-ready)
+Tracks requests in a rolling time window — the most accurate approach.
+```python
+import redis
+import time
+
+class SlidingWindowRateLimiter:
+    def __init__(self, redis_client, limit, window_seconds):
+        self.redis = redis_client
+        self.limit = limit
+        self.window = window_seconds
+
+    def is_allowed(self, client_id: str) -> bool:
+        now = time.time()
+        window_start = now - self.window
+        key = f"rate_limit:{client_id}"
+
+        pipe = self.redis.pipeline()
+        pipe.zremrangebyscore(key, 0, window_start)   # remove old entries
+        pipe.zadd(key, {str(now): now})               # add current request
+        pipe.zcard(key)                               # count requests in window
+        pipe.expire(key, self.window)
+        results = pipe.execute()
+
+        request_count = results[2]
+        return request_count <= self.limit
+```
+
+3. Fixed Window Counter (simplest)
+```python
+class FixedWindowRateLimiter:
+    def __init__(self, limit, window_seconds):
+        self.limit = limit
+        self.window = window_seconds
+        self.counts = {}  # {client_id: (count, window_start)}
+
+    def is_allowed(self, client_id: str) -> bool:
+        now = time.time()
+        count, window_start = self.counts.get(client_id, (0, now))
+
+        if now - window_start >= self.window:   # new window
+            count, window_start = 0, now
+
+        if count < self.limit:
+            self.counts[client_id] = (count + 1, window_start)
+            return True
+        return False
+```
+
+4. Middleware Integration (FastAPI example)
+```python 
+from fastapi import FastAPI, Request, HTTPException
+from functools import wraps
+
+app = FastAPI()
+limiter = SlidingWindowRateLimiter(redis_client, limit=100, window_seconds=60)
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    client_ip = request.client.host
+
+    if not limiter.is_allowed(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too Many Requests",
+            headers={
+                "Retry-After": "60",
+                "X-RateLimit-Limit": "100",
+                "X-RateLimit-Remaining": "0"
+            }
+        )
+
+    response = await call_next(request)
+    return response
+```
+Algorithm Comparison
+AlgorithmAccuracyMemoryBurst HandlingBest ForToken BucketGoodLow✅ Allows burstsMost APIsSliding WindowBestMedium✅ SmoothProduction systemsFixed WindowPoor (boundary spikes)Low❌Simple use casesLeaky BucketGoodLow❌ Strict queueStreaming / smooth output
+
+Key Design Decisions
+
+Per IP vs per API key — API keys are more reliable (IPs can be shared via NAT)
+Distributed systems — use Redis (atomic ops) instead of in-memory to share state across instances
+Return proper headers — always send X-RateLimit-Limit, X-RateLimit-Remaining, Retry-After
+Tiered limits — different limits per plan (free: 100/hr, pro: 10k/hr)
+
+The Sliding Window + Redis approach is what most production APIs (GitHub, Stripe, OpenAI) use.
