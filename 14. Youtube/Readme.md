@@ -223,3 +223,395 @@ contains 3 queues and a task scheduler.
 ### Non-Recoverable Errors
 - Stop malformed video processing and return error codes.
 
+
+
+## High-Level Architecture Overview for Translations, Captions and Subtitles 
+
+```
+Raw Video Upload
+       │
+       ▼
+┌─────────────────────────────────────────────────────┐
+│              Transcoding Pipeline                    │
+│                                                      │
+│  Video Processing  →  Audio Extraction  →  Speech   │
+│  (multiple quals)      (multi-track)      Recognition│
+└──────────┬─────────────────┬──────────────────┬─────┘
+           │                 │                  │
+           ▼                 ▼                  ▼
+    Video Segments      Audio Tracks        Raw Transcript
+    (HLS/DASH)          (AAC/Opus)          (with timestamps)
+           │                 │                  │
+           └────────┬────────┘                  │
+                    ▼                           ▼
+             CDN Distribution          Translation Pipeline
+                                               │
+                                    ┌──────────┴──────────┐
+                                    ▼                      ▼
+                             Auto-translate           Human Review
+                             (MT Engine)              (for accuracy)
+                                    │
+                                    ▼
+                              Subtitle/Caption
+                              Files (VTT/SRT)
+```
+
+---
+
+## 1. Auto Captions — Speech-to-Text Pipeline
+
+This is the foundation everything else builds on.
+
+```
+Audio Track
+     │
+     ▼
+┌─────────────────────────────────────────────┐
+│           ASR Pipeline                       │
+│                                             │
+│  1. Voice Activity Detection (VAD)          │
+│     → Strip silence, detect speech segments │
+│                                             │
+│  2. Acoustic Model                          │
+│     → Phoneme recognition                  │
+│     → Speaker diarization (who spoke when) │
+│                                             │
+│  3. Language Model                          │
+│     → Word probabilities, context          │
+│     → Handles accents, domain vocabulary   │
+│                                             │
+│  4. Timestamp Alignment                    │
+│     → Word-level timestamps (CTC alignment)│
+│     → "Hello"[0.0s-0.3s] "World"[0.4s-0.8s]│
+└─────────────────────────────────────────────┘
+     │
+     ▼
+Raw Transcript with word-level timestamps
+```
+
+### Output Format — WebVTT
+
+```
+WEBVTT
+
+00:00:01.000 --> 00:00:04.000
+The quick brown fox jumps over
+
+00:00:04.100 --> 00:00:07.500
+the lazy dog near the riverbank
+
+# Stored as:
+{
+  "segments": [
+    {
+      "start": 1.0,
+      "end": 4.0,
+      "text": "The quick brown fox jumps over",
+      "words": [
+        {"word": "The", "start": 1.0, "end": 1.2, "confidence": 0.99},
+        {"word": "quick", "start": 1.3, "end": 1.6, "confidence": 0.97},
+        ...
+      ]
+    }
+  ],
+  "language": "en",
+  "confidence": 0.94
+}
+```
+
+**Word-level timestamps are critical** — they enable:
+- Karaoke-style highlighting
+- Caption search ("find the moment they said X")
+- Accurate translation alignment
+
+---
+
+## 2. Translation Pipeline
+
+Once you have the source transcript, translation fans out to all target languages.
+
+```
+Source Transcript (EN)
+         │
+         ▼
+┌────────────────────────────────────────────┐
+│         Translation Orchestrator           │
+│                                            │
+│  Priority Queue by:                        │
+│  ├── Video popularity (viral = fast track) │
+│  ├── Language demand (Spanish before       │
+│  │   Esperanto)                            │
+│  └── Creator request                       │
+└────────────────┬───────────────────────────┘
+                 │  Fan out to all target languages
+    ┌────────────┼────────────┬─────────────┐
+    ▼            ▼            ▼             ▼
+  Spanish     French      Hindi          Japanese
+  MT Engine   MT Engine   MT Engine      MT Engine
+    │            │            │             │
+    ▼            ▼            ▼             ▼
+ ES captions  FR captions  HI captions  JA captions
+```
+
+### Translation Engine Design
+
+```python
+class TranslationPipeline:
+
+    def translate_transcript(self, transcript, target_lang):
+        segments = transcript.segments
+
+        # Segment-aware translation
+        # DON'T translate word by word — context matters
+        # DON'T translate full video at once — too long for MT
+
+        # Sliding window: translate chunks with overlap
+        chunks = self.create_chunks(
+            segments,
+            max_tokens=512,
+            overlap=2  # carry 2 segments for context
+        )
+
+        translated_chunks = []
+        for chunk in chunks:
+            result = self.mt_engine.translate(
+                text=chunk.text,
+                source_lang=transcript.language,
+                target_lang=target_lang,
+                context=chunk.surrounding_context
+            )
+            translated_chunks.append(result)
+
+        # Re-align timestamps after translation
+        # "Hello World" (EN, 0.5s) → "Hola Mundo" (ES, ~0.5s)
+        # Text length changes but timing stays source-anchored
+        return self.realign_timestamps(translated_chunks, segments)
+```
+
+### Timestamp Re-alignment Challenge
+
+```
+English:  [Hello World    ] → 0.0s to 0.8s  (2 words)
+German:   [Hallo Welt     ] → 0.0s to 0.8s  (2 words, similar length ✅)
+
+English:  [I love you     ] → 0.0s to 0.6s  (3 words)
+Japanese: [愛してる        ] → 0.0s to 0.6s  (1 word, much shorter ✅)
+
+English:  [Thanks         ] → 0.0s to 0.4s  (1 word)
+German:   [Vielen Dank    ] → 0.0s to 0.4s  (2 words, compressed ⚠️)
+
+Solution: Source timestamps are ALWAYS preserved
+          Translated text fits within source timing window
+          Line breaks adjusted for reading speed (17 chars/sec rule)
+```
+
+---
+
+## 3. Multi-Audio Track Design
+
+This is architecturally different from captions — it's actual audio streams, not text overlays.
+
+### Storage Architecture
+
+```
+video_id: abc123
+│
+├── video_tracks/
+│   ├── 1080p.mp4
+│   ├── 720p.mp4
+│   └── 360p.mp4
+│
+├── audio_tracks/
+│   ├── original_en.aac       ← always preserved
+│   ├── dubbed_es.aac         ← Spanish dub
+│   ├── dubbed_hi.aac         ← Hindi dub
+│   ├── dubbed_pt_BR.aac      ← Brazilian Portuguese
+│   └── descriptive_en.aac    ← Audio description (accessibility)
+│
+└── subtitle_tracks/
+    ├── en.vtt
+    ├── es.vtt
+    ├── hi.vtt
+    └── auto_en.vtt           ← auto-generated
+```
+
+### DASH Manifest (MPD) — How Player Selects Audio
+
+```xml
+<MPD>
+  <!-- Video Adaptation Set -->
+  <AdaptationSet mimeType="video/mp4">
+    <Representation bandwidth="4000000" height="1080"/>
+    <Representation bandwidth="2000000" height="720"/>
+  </AdaptationSet>
+
+  <!-- Audio Adaptation Set — Multiple Languages -->
+  <AdaptationSet mimeType="audio/mp4" lang="en">
+    <Label>English (Original)</Label>
+    <Representation bandwidth="128000" audioSamplingRate="48000"/>
+  </AdaptationSet>
+
+  <AdaptationSet mimeType="audio/mp4" lang="es">
+    <Label>Spanish (Dubbed)</Label>
+    <Representation bandwidth="128000" audioSamplingRate="48000"/>
+  </AdaptationSet>
+
+  <!-- Subtitle Tracks -->
+  <AdaptationSet mimeType="text/vtt" lang="en">
+    <Representation src="en.vtt"/>
+  </AdaptationSet>
+</MPD>
+```
+
+The player downloads this manifest and lets the user switch audio/subtitle tracks **without re-buffering** — only the audio segment changes.
+
+---
+
+## 4. Subtitle vs Caption — Design Difference
+
+```
+┌─────────────────────┬──────────────────────────────────────────┐
+│ Captions (CC)       │ Subtitles                                │
+├─────────────────────┼──────────────────────────────────────────┤
+│ Same language as    │ Different language from audio            │
+│ audio               │                                          │
+├─────────────────────┼──────────────────────────────────────────┤
+│ Includes non-speech │ Speech only                             │
+│ [Music playing]     │                                          │
+│ [Door slams]        │                                          │
+├─────────────────────┼──────────────────────────────────────────┤
+│ Accessibility focus │ Language comprehension focus             │
+├─────────────────────┼──────────────────────────────────────────┤
+│ Auto-generated from │ Translated from source captions          │
+│ ASR                 │                                          │
+└─────────────────────┴──────────────────────────────────────────┘
+
+Storage: Both use VTT/SRT format — design is same
+Difference is in the generation pipeline, not storage
+```
+
+---
+
+## 5. Creator-Uploaded vs Auto-Generated — Versioning
+
+```
+subtitle_versions table:
+┌──────────┬─────────┬──────────┬────────────┬───────────┬────────┐
+│ video_id │ lang    │ version  │ source     │ status    │ is_    │
+│          │         │          │            │           │ active │
+├──────────┼─────────┼──────────┼────────────┼───────────┼────────┤
+│ abc123   │ en      │ 1        │ AUTO_ASR   │ published │ false  │
+│ abc123   │ en      │ 2        │ CREATOR    │ published │ true   │ ← wins
+│ abc123   │ es      │ 1        │ AUTO_MT    │ published │ false  │
+│ abc123   │ es      │ 2        │ COMMUNITY  │ review    │ false  │
+│ abc123   │ hi      │ 1        │ AUTO_MT    │ published │ true   │
+└──────────┴─────────┴──────────┴────────────┴───────────┴────────┘
+
+Priority: Creator upload > Community > Auto-MT > Auto-ASR
+```
+
+---
+
+## 6. Community Contributions (Like Wikipedia for Captions)
+
+```
+                  User submits correction
+                          │
+                          ▼
+              ┌───────────────────────┐
+              │   Contribution Queue  │
+              │                       │
+              │  Diff against current │
+              │  active version       │
+              └──────────┬────────────┘
+                         │
+            ┌────────────┴────────────┐
+            ▼                         ▼
+       Minor fix                  Major rewrite
+    (typo, timing)              (full retranslation)
+            │                         │
+            ▼                         ▼
+     Auto-approve              3 community reviewers
+     if confidence > 0.9       must approve
+            │                         │
+            └────────────┬────────────┘
+                         ▼
+                  Publish new version
+                  Credit contributor
+```
+
+---
+
+## 7. Processing Infrastructure
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                   Job Queue (Kafka)                       │
+│                                                          │
+│  Topic: video.uploaded                                   │
+│  Topic: caption.asr_complete                             │
+│  Topic: caption.translation_requested                    │
+│  Topic: audio.dub_uploaded                               │
+└──────────────┬───────────────────────────────────────────┘
+               │
+    ┌──────────┼──────────┬──────────────┐
+    ▼          ▼          ▼              ▼
+ ASR         MT        Audio          Quality
+ Workers     Workers   Mux Workers    Check Workers
+ (GPU fleet) (GPU)     (CPU)          (automated)
+    │          │          │              │
+    └──────────┴──────────┴──────────────┘
+                          │
+                    Object Storage
+                    (S3 / GCS)
+                    ├── .vtt files
+                    ├── .aac audio tracks
+                    └── manifest files
+```
+
+### SLAs by Content Type
+
+```
+Viral video (> 100K views/hr):
+  ├── Auto-captions:     < 5 min after upload
+  ├── Top 10 languages:  < 30 min
+  └── All languages:     < 2 hours
+
+Normal video:
+  ├── Auto-captions:     < 30 min
+  ├── Top 10 languages:  < 4 hours
+  └── All languages:     < 24 hours
+
+Long-tail / old video:
+  └── On-demand generation when first requested
+      (lazy generation, not eager)
+```
+
+---
+
+## Key Design Decisions Summary
+
+```
+1. ASR first → everything else derives from it
+   └── Word-level timestamps are non-negotiable
+
+2. Logical separation of concerns
+   ├── Captions  = text track (VTT/SRT, tiny files)
+   ├── Subtitles = translated text track (same format)
+   └── Audio dub = full audio stream (separate AAC file)
+
+3. DASH/HLS manifest ties it all together
+   └── Player switches tracks without re-buffering
+
+4. Lazy generation for long-tail
+   └── Don't pre-generate 100 languages for every video
+       Generate on first request, cache forever
+
+5. Priority queue for processing
+   └── Popularity-aware, not FIFO
+
+6. Versioning with clear precedence
+   └── Creator > Community > Auto — always
+```
+
+This pipeline is essentially what YouTube, Netflix (for dubbing), and Amazon Prime use — with Netflix investing most heavily in studio-quality multi-audio dubbing infrastructure.
